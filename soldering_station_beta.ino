@@ -14,7 +14,7 @@ int mode = 0;
 
 // temperature potentiometer
 #define POTENTIOMETER_INPUT_PIN A0
-int minTemp = 25;
+int minTemp = 200;
 int maxTemp = 450;
 float setTemp = minTemp;
 
@@ -26,16 +26,23 @@ LiquidCrystal_I2C lcd(0x38,16,2); // adress 0x38 if A0,A1,A2 are GND
 #define thermo_CS 11
 #define thermo_SCK 9
 MAX6675 thermocouple(thermo_SCK, thermo_CS, thermo_DO);
-double indTemp = 0;
+float indTemp = 0;
 
 // PID
-double setpoint, input, output; //Define Variables we'll be connecting to
+float setpoint, input, output; //Define Variables we'll be connecting to
 PID myPID(&input, &output, &setpoint, 2, 5, 1, DIRECT); //Specify the links and initial tuning parameters
-double aggKp=4, aggKi=0.2, aggKd=1; //Define the aggressive Tuning Parameters
-double consKp=1, consKi=0.05, consKd=0.25; //Define the conservative Tuning Parameters
+//double aggKp=4, aggKi=0.2, aggKd=1; //Define the aggressive Tuning Parameters
+//double consKp=1, consKi=0.05, consKd=0.25; //Define the conservative Tuning Parameters
+float Kp=4.00, Ki=0.04, Kd=0.00; //Define tuning parameters
 double gap = 0;
 #define PWM_PIN 6
 int PWMvalue = 0;
+
+// SERIAL COMMUNICATION
+unsigned long timeOfUpdate = 0;
+int timeSinceUpdate = 0; // used to determine time since last transmission of temps
+byte* toSent; // used in transmission of float numbers
+char flag = 'X'; // flag needed for parameters exchange
 
 // --SETUP
 void setup() {
@@ -45,9 +52,14 @@ void setup() {
   pinMode(PWM_PIN, OUTPUT); // setting PWM pin
   
   lcd.init(); // initializing the LCD
+  lcd.clear();
+  lcd.setCursor(4,0);
+  lcd.print("Rywald");
+  lcd.setCursor(2,1);
+  lcd.print("productions");
 
-  delay(500); // wait for MAX chip to stabilize
-
+  // tuning PID
+  myPID.SetTunings(Kp, Ki, Kd);
   //initialize the variables for PID
   indTemp = thermocouple.readCelsius();
   input = indTemp;
@@ -55,6 +67,13 @@ void setup() {
   setpoint = setTemp;
   myPID.SetOutputLimits(0,255); // setting PWMvalue limit
   myPID.SetMode(AUTOMATIC); //turn the PID on
+
+  // SERIAL COMMUNICATION
+  Serial.begin(9600);
+  while(!Serial);
+  timeOfUpdate = millis();
+
+  delay(2500); // wait for MAX chip to stabilize & welcome screen
 }
 
 // --MAIN PROGRAM
@@ -72,7 +91,9 @@ void loop() {
       if (previousModeButtonState != modeButtonState)
       {
         if (!modeButtonState) {
-          if (mode<2) mode = mode+1;
+          if (mode<2) {
+            mode = mode+1;
+          }
           else mode = 0;  
         }
         previousModeButtonState = modeButtonState;
@@ -80,22 +101,18 @@ void loop() {
 
       // potentiometer sygnal processing
       setTemp = (maxTemp-minTemp)*(analogRead(POTENTIOMETER_INPUT_PIN)/1023.00)+minTemp;
-      setpoint = setTemp; 
+      setTemp = round(setTemp/5)*5;
+      setpoint = setTemp;
 
       // behave differently in case of each mode setting
       if (mode == 0) { // OFF
+        setpoint = 0;
         analogWrite(PWM_PIN,0);
         PWMvalue = 0;
       }
       else if (mode == 1) { // ON
         // stepoint tracking (PID)
         gap = abs(setpoint-input); //distance from setpoint
-        if(gap < 10) {  //we're close to setpoint, use conservative tuning parameters
-           myPID.SetTunings(consKp, consKi, consKd);
-        }
-        else {   //we're far from setpoint, use aggressive tuning parameters
-         myPID.SetTunings(aggKp, aggKi, aggKd);
-        }
         myPID.Compute();
         analogWrite(PWM_PIN,output);
         PWMvalue = (output/255)*100;
@@ -104,12 +121,12 @@ void loop() {
         // stepoint tracking (PID)
         setpoint = 200; // const setpoint
         gap = abs(setpoint-input); //distance from setpoint
-        if(gap < 10) {  //we're close to setpoint, use conservative tuning parameters
-           myPID.SetTunings(consKp, consKi, consKd);
-        }
-        else {   //we're far from setpoint, use aggressive tuning parameters
-           myPID.SetTunings(aggKp, aggKi, aggKd);
-        }
+//        if(gap < 5) {  //we're close to setpoint, use conservative tuning parameters
+//           myPID.SetTunings(consKp, consKi, consKd);
+//        }
+//        else {   //we're far from setpoint, use aggressive tuning parameters
+//           myPID.SetTunings(aggKp, aggKi, aggKd);
+//        }
         myPID.Compute();
         analogWrite(PWM_PIN,output);
         PWMvalue = (output/255)*100;
@@ -125,7 +142,7 @@ void loop() {
       // LCD update
       lcd.home();
       lcd.print("Set ");
-      lcd.print((int)round(setTemp),DEC);
+      lcd.print(round(setTemp/5)*5,DEC);
       lcd.print("  ");
       lcd.setCursor(7,0);
       lcd.write((char)223);
@@ -156,7 +173,7 @@ void loop() {
           lcd.print("Incorrect mode");
           break;
       }
-      delay(200);
+      delay(150);
   }
   else // thermocouple (soldering-iron) not connected
   {
@@ -168,5 +185,59 @@ void loop() {
       //lcd.clear();
       delay(1000);
   }
+
+  // PARAMETERS EXCHANGE
+   if(Serial.available()>0) {
+    
+    flag = Serial.read();
+    
+    if (flag == 'T') { // transfer request flag
+      toSent = (byte*) &Kp;
+      Serial.write(toSent,4);
+      toSent = (byte*) &Ki;
+      Serial.write(toSent,4);
+      toSent = (byte*) &Kd;
+      Serial.write(toSent,4);
+      flag = 'X';
+    }
+    
+    else if (flag == 'R') { // receive request flag
+      byte buffor[4];
+      float* number = (float*)buffor;
+
+      // counting waiting time
+      long int startTime = millis();
+
+      // waiting till all bytes come or waiting time is more than 1s
+      while(Serial.available() < 12 && (millis() - startTime) < 1000) {}
+
+      if(Serial.available() >= 12) {
+        // reading Kp
+        for (int i = 0; i < 4; i++) {buffor[i] = Serial.read();}
+        Kp = *number;
+        // reading Ki
+        for (int i = 0; i < 4; i++) {buffor[i] = Serial.read();}
+        Ki = *number;
+        // reading Kd
+        for (int i = 0; i < 4; i++) {buffor[i] = Serial.read();}
+        Kd = *number;
+      }
+
+      myPID.SetTunings(Kp, Ki, Kd);
+      flag = 'X';
+    }
+    
+    else { while (Serial.available() > 0) {Serial.read();} }
+  }
+
+  // UPDATE TRANSMISSION
+  timeSinceUpdate = millis() - timeOfUpdate;
+  timeOfUpdate = millis();
+  toSent = (byte*) &timeSinceUpdate;
+  Serial.write(toSent,2);
+  toSent = (byte*) &setpoint;
+  Serial.write(toSent,4);
+  toSent = (byte*) &indTemp;
+  Serial.write(toSent,4);
   
 }
